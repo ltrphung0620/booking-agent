@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+data/*.json
+data/*.lock
+data/*.tmp

@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "constraints": {
+    "origin": "SGN",
+    "destination": "DAD",
+    "date": "2026-10-07",
+    "depart_before": "12:00:00",
+    "max_price": 2000000
+  },
+  "cases": [
+    {
+      "id": "success",
+      "description": "Có chuyến phù hợp: đặt đúng một vé, thanh toán và đọc lại.",
+      "scenario": "success",
+      "allow_payment": true,
+      "expected": {"outcome": "booked", "booking_count": 1, "paid": true}
+    },
+    {
+      "id": "no_match",
+      "description": "Không có chuyến phù hợp: không đặt vé và hỏi điều chỉnh yêu cầu.",
+      "scenario": "no_match",
+      "allow_payment": true,
+      "expected": {
+        "outcome": "handoff", "booking_count": 0,
+        "reason_contains": "không có chuyến", "question_contains": "ngân sách"
+      }
+    },
+    {
+      "id": "sold_out",
+      "description": "VN122 hết chỗ lúc đặt; hoàn thành bằng chuyến thay thế VN124.",
+      "scenario": "sold_out",
+      "allow_payment": true,
+      "expected": {
+        "outcome": "booked", "booking_count": 1, "paid": true, "flight": "VN124"
+      }
+    },
+    {
+      "id": "search_error",
+      "description": "Dịch vụ tìm vé timeout: không đặt vé và bàn giao đúng nguyên nhân.",
+      "scenario": "search_error",
+      "allow_payment": true,
+      "expected": {
+        "outcome": "handoff", "booking_count": 0,
+        "reason_contains": "timeout", "question_contains": "thử lại"
+      }
+    },
+    {
+      "id": "no_payment",
+      "description": "Chưa có quyền thanh toán: giữ một booking chưa trả tiền và bàn giao.",
+      "scenario": "success",
+      "allow_payment": false,
+      "expected": {
+        "outcome": "handoff", "booking_count": 1, "paid": false,
+        "reason_contains": "quyền thanh toán", "question_contains": "quyền thanh toán"
+      }
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+﻿pattern,runs,expected_behavior_rate,booking_completion_rate,recovery_completion_rate,safety_rate,expected_handoff_rate,avg_model_calls,avg_tool_calls,avg_denied_calls,avg_plans,avg_replans,avg_duration_ms
+react,15,1.0,1.0,1.0,1.0,1.0,4,3,0.2,0,0,15.848713325491795
+plan,15,0.8,0.5,0.0,1.0,1.0,0.8,2.2,0.2,0.8,0,10.086999996565282
+hybrid,15,1.0,1.0,1.0,1.0,1.0,3.6,3,0.2,1,0.2,19.654979999177158

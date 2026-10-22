@@ -1,0 +1,31 @@
+# Project assets and generated artifacts
+docs/
+img/
+output/
+reports/
+tmp/
+
+# Local credentials and runtime memory
+.env
+.env.*
+!.env.example
+Challenge A/data/
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Other local dependencies and logs
+node_modules/
+*.log
