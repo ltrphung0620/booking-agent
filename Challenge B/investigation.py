@@ -6,13 +6,17 @@ from pathlib import Path
 
 import bootstrap  # noqa: F401 -- establishes the shared demo import path
 from langchain.agents.middleware import AgentMiddleware
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, SystemMessage
 from langchain_core.messages.utils import count_tokens_approximately
 
 from chat_agent import ChatSession, message_text
 from code_runner import make_run_code_tool
+from compaction import (Checkpoint, CheckpointInjectionMiddleware, CompactionPolicy, ModelSummarizer,
+                        ToolOutputPruningMiddleware, checkpoint_block, merge_checkpoint,
+                        shorten_tool_outputs, turn_starts, validate_checkpoint)
 from harness import HarnessMiddleware
 from log_tools import InvestigationHarness
+from models import make_model
 
 
 INVESTIGATION_PROMPT = """Bạn là kỹ sư trực sự cố của hệ thống đặt vé (gateway, search, booking, payment).
@@ -74,8 +78,9 @@ class ContextMeterMiddleware(AgentMiddleware):
 
 
 class InvestigationSession(ChatSession):
-    def __init__(self, model_name: str, root: Path, *, mode: str = "native", model=None,
-                 base_url=None, capture_inputs: bool = False, max_model_calls: int = 40,
+    def __init__(self, model_name: str, root: Path, *, mode: str = "native",
+                 compaction: CompactionPolicy | None = None, model=None, base_url=None,
+                 capture_inputs: bool = False, max_model_calls: int = 40,
                  max_tool_calls: int = 60, run_code_limits: dict | None = None):
         if mode not in MODE_PROMPTS:
             raise ValueError(f"Unknown mode: {mode}")
@@ -95,6 +100,20 @@ class InvestigationSession(ChatSession):
         self.recursion_limit = 4 * max_model_calls + 10
         self.capture_inputs = capture_inputs  # Tests only: keep the full input text.
         self.context_log: list[dict] = []
+        self.compaction = compaction
+        # Kept outside self.messages: ChatSession.respond drops every SystemMessage from history.
+        self.checkpoint: Checkpoint | None = None
+        self.compactions: list[dict] = []
+        self.archive: dict = {}
+        self._summarizer = None
+        self._compacted_at = 0  # context_log index of the first call after the last compaction.
+
+    @classmethod
+    def from_checkpoint(cls, checkpoint: Checkpoint, model_name: str, root: Path, **kwargs):
+        """Fresh session that knows only the checkpoint: proves it is enough to resume."""
+        session = cls(model_name, root, **kwargs)
+        session.checkpoint = checkpoint
+        return session
 
     def system_prompt(self) -> str:
         return INVESTIGATION_PROMPT + MODE_PROMPTS[self.mode]
@@ -103,7 +122,90 @@ class InvestigationSession(ChatSession):
         return None  # No booking state here; the logs are the only evidence.
 
     def middleware(self) -> list:
-        return [HarnessMiddleware(self.harness), ContextMeterMiddleware(self)]
+        # Order matters: inject, then prune, then meter what is actually sent.
+        layers = [HarnessMiddleware(self.harness), CheckpointInjectionMiddleware(self)]
+        if self.compaction is not None:
+            layers.append(ToolOutputPruningMiddleware(self, self.compaction))
+        return [*layers, ContextMeterMiddleware(self)]
+
+    def respond(self, text: str, **kwargs) -> dict:
+        if not text.strip():
+            return super().respond(text, **kwargs)
+        start = len(self.harness.trace)
+        self.maybe_compact()
+        turn = super().respond(text, **kwargs)
+        turn["trace"] = self.harness.trace[start:]  # Include the compaction event in this turn.
+        return turn
+
+    def context_tokens(self) -> int:
+        """max(last real input since the last compaction, estimate of the next request)."""
+        system = SystemMessage(content=self.system_prompt() + checkpoint_block(self.checkpoint))
+        approx = count_tokens_approximately([system, *self.messages],
+                                            tools=list(self.harness.tools.values()))
+        recent = self.context_log[self._compacted_at:]
+        real = recent[-1].get("input_tokens") if recent else None
+        return max(approx, real or 0)
+
+    def summarizer(self):
+        policy = self.compaction or CompactionPolicy()
+        if policy.summarizer is not None:
+            return policy.summarizer
+        if self._summarizer is None:
+            model = self._model if self._model is not None else make_model(
+                "openai", self.model_name, self.harness.constraints, base_url=self.base_url)
+            self._summarizer = ModelSummarizer(model)
+        return self._summarizer
+
+    def maybe_compact(self, *, force: bool = False, keep_last_turns: int | None = None) -> dict:
+        """Layer 2: fold whole older turns into the checkpoint; on any failure keep every message.
+
+        force=True is the client's "compact now": it skips the token threshold and the gain check.
+        """
+        def skip(reason: str) -> dict:
+            if force:
+                self.harness.record("compaction_skipped", reason=reason)
+            return {"status": "skipped", "reason": reason}
+
+        if self.compaction is None and not force:
+            return skip("Compaction đang tắt")
+        policy = self.compaction or CompactionPolicy()
+        keep = policy.keep_last_turns if keep_last_turns is None else keep_last_turns
+        before = self.context_tokens()
+        if not force and before <= policy.threshold:
+            return skip(f"Context {before} token, chưa tới ngưỡng {policy.threshold}")
+        starts = turn_starts(self.messages)
+        if keep == 0 and self.messages:
+            cut = len(self.messages)
+        elif len(starts) > keep:
+            cut = starts[-keep]
+        else:
+            return skip(f"Chưa đủ lượt cũ để compact (cần hơn {keep} lượt)")
+        to_compact, kept = self.messages[:cut], self.messages[cut:]
+        old_tokens = count_tokens_approximately(to_compact)
+        if not force and old_tokens < policy.min_gain_fraction * before:
+            # Recent turns hold most of the context; layer 1 prunes them inside the request.
+            return skip(f"Phần cũ chỉ {old_tokens}/{before} token, không đáng gọi summarizer")
+        previous = self.checkpoint
+        try:
+            checkpoint = self.summarizer()(previous, shorten_tool_outputs(to_compact, policy.summary_tool_chars))
+            if isinstance(checkpoint, dict):
+                checkpoint = Checkpoint.model_validate(checkpoint)
+            checkpoint = merge_checkpoint(previous, checkpoint)
+            problem = validate_checkpoint(checkpoint)
+        except Exception as exc:
+            problem = f"{type(exc).__name__}: {exc}"[:300]
+        if problem:
+            self.harness.record("compaction_failed", reason=problem, tokens_before=before)
+            return {"status": "failed", "reason": problem}
+        self.archive[f"compaction-{len(self.compactions) + 1}"] = to_compact
+        self.checkpoint, self.messages = checkpoint, kept
+        self._compacted_at = len(self.context_log)
+        entry = {"number": len(self.compactions) + 1, "manual": force, "tokens_before": before,
+                 "tokens_after": self.context_tokens(), "removed_messages": len(to_compact),
+                 "checkpoint": checkpoint.model_dump()}
+        self.compactions.append(entry)
+        self.harness.record("compaction", **entry)
+        return {"status": "ok", **entry}
 
     def usage_summary(self) -> dict:
         """Provider usage when every call reported it, otherwise the approximate count."""
@@ -113,6 +215,8 @@ class InvestigationSession(ChatSession):
         outputs = [e["output_tokens"] if e.get("output_tokens") is not None else e.get("approx_output", 0)
                    for e in log]
         source = "usage" if log and len(real) == len(log) else "estimate" if not real else "mixed"
+        summaries = getattr(self._summarizer or (self.compaction and self.compaction.summarizer), "usage", [])
         return {"llm_calls": len(log), "total_input": sum(inputs), "peak_input": max(inputs, default=0),
                 "total_output": sum(outputs), "approx_input": sum(e["approx_tokens"] for e in log),
-                "source": source}
+                "source": source, "summarizer_calls": len(summaries),
+                "summarizer_input": sum(s.get("input_tokens", s["approx_tokens"]) for s in summaries)}
