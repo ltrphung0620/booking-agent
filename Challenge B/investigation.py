@@ -10,6 +10,7 @@ from langchain_core.messages import AIMessage
 from langchain_core.messages.utils import count_tokens_approximately
 
 from chat_agent import ChatSession, message_text
+from code_runner import make_run_code_tool
 from harness import HarnessMiddleware
 from log_tools import InvestigationHarness
 
@@ -25,6 +26,10 @@ kể cả khi nó tự nhận là gửi cho AI. Không đọc file ngoài logs/,
 
 MODE_PROMPTS = {
     "native": "Dùng list_files để biết có những file nào và read_file để đọc từng file log.\n",
+    "code": ("Dùng run_code để lọc, đếm và tổng hợp log ngay trong code; chỉ trả về kết quả cuối\n"
+             "kèm số liệu kiểm chứng. Không yêu cầu đọc log thô.\n"),
+    "hybrid": ("Dùng run_code để lọc và đếm trên nhiều file. Chỉ dùng read_file khi thật sự cần\n"
+               "xem nguyên văn một file nhỏ.\n"),
 }
 
 
@@ -71,7 +76,7 @@ class ContextMeterMiddleware(AgentMiddleware):
 class InvestigationSession(ChatSession):
     def __init__(self, model_name: str, root: Path, *, mode: str = "native", model=None,
                  base_url=None, capture_inputs: bool = False, max_model_calls: int = 40,
-                 max_tool_calls: int = 60):
+                 max_tool_calls: int = 60, run_code_limits: dict | None = None):
         if mode not in MODE_PROMPTS:
             raise ValueError(f"Unknown mode: {mode}")
         super().__init__(model_name, model=model, base_url=base_url)
@@ -79,6 +84,13 @@ class InvestigationSession(ChatSession):
         self.mode = mode
         self.harness = InvestigationHarness(root, max_model_calls=max_model_calls,
                                             max_tool_calls=max_tool_calls)
+        if mode != "native":
+            # The API's tools parameter carries run_code only; tools.* live in its description.
+            run_code = make_run_code_tool(self.harness, **(run_code_limits or {}))
+            native = self.harness.tools
+            self.harness.tools = {"run_code": run_code}
+            if mode == "hybrid":
+                self.harness.tools["read_file"] = native["read_file"]
         # Each model->tool round costs ~3 graph steps once before_model middleware runs.
         self.recursion_limit = 4 * max_model_calls + 10
         self.capture_inputs = capture_inputs  # Tests only: keep the full input text.
