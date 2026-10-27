@@ -115,10 +115,22 @@ class ChatSession:
         self.harness = ChatHarness(scenario)
         self.messages = []
         self.turns: list[dict] = []
+        self.recursion_limit = 50
         self._model = model  # Injection for offline integration tests.
 
     def system_prompt(self) -> str:
         return CHAT_PROMPT
+
+    def turn_context(self, allow_payment: bool) -> dict | None:
+        """Server-side state injected each turn; None skips the system message."""
+        h = self.harness
+        return {
+            "today": datetime.now(timezone(timedelta(hours=7))).date().isoformat(),
+            "trip_configured": h.trip_configured,
+            "constraints": h.constraints.model_dump(mode="json") if h.trip_configured else None,
+            "bookings": list(h.service.bookings.values()),
+            "allow_simulated_payment": allow_payment,
+        }
 
     def middleware(self) -> list:
         return [HarnessMiddleware(self.harness)]
@@ -135,22 +147,14 @@ class ChatSession:
             model = self._model if self._model is not None else make_model(
                 "openai", self.model_name, h.constraints, base_url=self.base_url)
             # Server-side state is authoritative, including after a failed API turn.
-            context = {
-                "today": datetime.now(timezone(timedelta(hours=7))).date().isoformat(),
-                "trip_configured": h.trip_configured,
-                "constraints": h.constraints.model_dump(mode="json") if h.trip_configured else None,
-                "bookings": list(h.service.bookings.values()),
-                "allow_simulated_payment": allow_payment,
-            }
+            context = self.turn_context(allow_payment)
+            state = [] if context is None else [SystemMessage(
+                content="Trạng thái hiện tại từ hệ thống: " + json.dumps(context, ensure_ascii=False))]
             agent = create_agent(model=model, tools=list(h.tools.values()),
                                  system_prompt=self.system_prompt(),
                                  middleware=self.middleware())
-            result = agent.invoke({"messages": [
-                *self.messages,
-                SystemMessage(content="Trạng thái hiện tại từ hệ thống: " +
-                              json.dumps(context, ensure_ascii=False)),
-                user,
-            ]}, config={"recursion_limit": 50})
+            result = agent.invoke({"messages": [*self.messages, *state, user]},
+                                  config={"recursion_limit": self.recursion_limit})
             # Dynamic state is re-injected each turn, not accumulated as stale facts.
             self.messages = [m for m in result["messages"] if not isinstance(m, SystemMessage)]
             answer = message_text(self.messages[-1]) or "Bạn muốn mình hỗ trợ bước tiếp theo thế nào?"
